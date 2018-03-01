@@ -26,6 +26,7 @@
 #include <netinet/tcp.h>
 
 #include <common/base64.h>
+#include <common/cfgparse.h>
 #include <common/chunk.h>
 #include <common/compat.h>
 #include <common/config.h>
@@ -3445,7 +3446,8 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		}
 	}
 
-	if (conn && conn->flags & CO_FL_EARLY_DATA) {
+	if (conn && (conn->flags & CO_FL_EARLY_DATA) &&
+	    (conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_HANDSHAKE))) {
 		struct hdr_ctx ctx;
 
 		ctx.idx = 0;
@@ -4634,16 +4636,8 @@ int http_sync_res_state(struct stream *s)
 			 * let's enforce it now that we're not expecting any new
 			 * data to come. The caller knows the stream is complete
 			 * once both states are CLOSED.
-			 *
-			 * However, there is an exception if the response length
-			 * is undefined. In this case, we switch in TUNNEL mode.
 			 */
-			if (!(txn->rsp.flags & HTTP_MSGF_XFER_LEN)) {
-				channel_auto_read(chn);
-				txn->rsp.msg_state = HTTP_MSG_TUNNEL;
-				chn->flags |= CF_NEVER_WAIT;
-			}
-			else if (!(chn->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
+			if (!(chn->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
 				channel_shutr_now(chn);
 				channel_shutw_now(chn);
 			}
@@ -6241,6 +6235,8 @@ http_msg_forward_body(struct stream *s, struct http_msg *msg)
 		/* The server still sending data that should be filtered */
 		if (!(chn->flags & CF_SHUTR) && HAS_DATA_FILTERS(s, chn))
 			goto missing_data_or_waiting;
+		msg->msg_state = HTTP_MSG_TUNNEL;
+		goto ending;
 	}
 
 	msg->msg_state = HTTP_MSG_ENDING;
@@ -6262,7 +6258,8 @@ http_msg_forward_body(struct stream *s, struct http_msg *msg)
 			 /* default_ret */ 1,
 			 /* on_error    */ goto error,
 			 /* on_wait     */ goto waiting);
-	msg->msg_state = HTTP_MSG_DONE;
+	if (msg->msg_state == HTTP_MSG_ENDING)
+		msg->msg_state = HTTP_MSG_DONE;
 	return 1;
 
   missing_data_or_waiting:
@@ -8543,15 +8540,23 @@ struct act_rule *parse_http_req_cond(const char **args, const char *file, int li
 		proxy->conf.lfs_file = strdup(proxy->conf.args.file);
 		proxy->conf.lfs_line = proxy->conf.args.line;
 		cur_arg += 1;
-	} else if (strncmp(args[0], "track-sc", 8) == 0 &&
-		 args[0][9] == '\0' && args[0][8] >= '0' &&
-		 args[0][8] < '0' + MAX_SESS_STKCTR) { /* track-sc 0..9 */
+	} else if (strncmp(args[0], "track-sc", 8) == 0) {
 		struct sample_expr *expr;
 		unsigned int where;
 		char *err = NULL;
+		unsigned int tsc_num;
+		const char *tsc_num_str;
 
 		cur_arg = 1;
 		proxy->conf.args.ctx = ARGC_TRK;
+
+		tsc_num_str = &args[0][8];
+		if (cfg_parse_track_sc_num(&tsc_num, tsc_num_str, tsc_num_str + strlen(tsc_num_str), &err) == -1) {
+			ha_alert("parsing [%s:%d] : error detected in %s '%s' while parsing 'http-request %s' rule : %s.\n",
+				 file, linenum, proxy_type_str(proxy), proxy->id, args[0], err);
+			free(err);
+			goto out_err;
+		}
 
 		expr = sample_parse_expr((char **)args, &cur_arg, file, linenum, &err, &proxy->conf.args);
 		if (!expr) {
@@ -8589,7 +8594,7 @@ struct act_rule *parse_http_req_cond(const char **args, const char *file, int li
 			cur_arg++;
 		}
 		rule->arg.trk_ctr.expr = expr;
-		rule->action = ACT_ACTION_TRK_SC0 + args[0][8] - '0';
+		rule->action = ACT_ACTION_TRK_SC0 + tsc_num;
 		rule->check_ptr = check_trk_action;
 	} else if (strcmp(args[0], "redirect") == 0) {
 		struct redirect_rule *redir;
@@ -9148,15 +9153,23 @@ struct act_rule *parse_http_res_cond(const char **args, const char *file, int li
 		redir->cond = NULL;
 		cur_arg = 2;
 		return rule;
-	} else if (strncmp(args[0], "track-sc", 8) == 0 &&
-	                   args[0][9] == '\0' && args[0][8] >= '0' &&
-	                   args[0][8] < '0' + MAX_SESS_STKCTR) { /* track-sc 0..9 */
+	} else if (strncmp(args[0], "track-sc", 8) == 0) {
 		struct sample_expr *expr;
 		unsigned int where;
 		char *err = NULL;
+		unsigned int tsc_num;
+		const char *tsc_num_str;
 
 		cur_arg = 1;
 		proxy->conf.args.ctx = ARGC_TRK;
+
+		tsc_num_str = &args[0][8];
+		if (cfg_parse_track_sc_num(&tsc_num, tsc_num_str, tsc_num_str + strlen(tsc_num_str), &err) == -1) {
+			ha_alert("parsing [%s:%d] : error detected in %s '%s' while parsing 'http-response %s' rule : %s.\n",
+				 file, linenum, proxy_type_str(proxy), proxy->id, args[0], err);
+			free(err);
+			goto out_err;
+		}
 
 		expr = sample_parse_expr((char **)args, &cur_arg, file, linenum, &err, &proxy->conf.args);
 		if (!expr) {
@@ -9194,7 +9207,7 @@ struct act_rule *parse_http_res_cond(const char **args, const char *file, int li
 			cur_arg++;
 		}
 		rule->arg.trk_ctr.expr = expr;
-		rule->action = ACT_ACTION_TRK_SC0 + args[0][8] - '0';
+		rule->action = ACT_ACTION_TRK_SC0 + tsc_num;
 		rule->check_ptr = check_trk_action;
 	} else if (((custom = action_http_res_custom(args[0])) != NULL)) {
 		char *errmsg = NULL;

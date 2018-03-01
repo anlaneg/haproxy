@@ -389,12 +389,12 @@ struct sample_fetch *find_sample_fetch(const char *kw, int len)
 	return NULL;
 }
 
-/* This fucntion browse the list of available saple fetch. <current> is
+/* This function browses the list of available sample fetches. <current> is
  * the last used sample fetch. If it is the first call, it must set to NULL.
- * <idx> is the index of the next sampleèfetch entry. It is used as private
- * value. It is useles to initiate it.
+ * <idx> is the index of the next sample fetch entry. It is used as private
+ * value. It is useless to initiate it.
  *
- * It returns always the newt fetch_sample entry, and NULL when the end of
+ * It returns always the new fetch_sample entry, and NULL when the end of
  * the list is reached.
  */
 struct sample_fetch *sample_fetch_getnext(struct sample_fetch *current, int *idx)
@@ -496,8 +496,6 @@ struct sample_conv *find_sample_conv(const char *kw, int len)
 
 /******************************************************************/
 /*          Sample casts functions                                */
-/*   Note: these functions do *NOT* set the output type on the    */
-/*   sample, the caller is responsible for doing this on return.  */
 /******************************************************************/
 
 static int c_ip2int(struct sample *smp)
@@ -533,7 +531,7 @@ static int c_ipv62ip(struct sample *smp)
 {
 	if (!v6tov4(&smp->data.u.ipv4, &smp->data.u.ipv6))
 		return 0;
-	smp->data.type = SMP_T_IPV6;
+	smp->data.type = SMP_T_IPV4;
 	return 1;
 }
 
@@ -1605,11 +1603,28 @@ static int sample_conv_str2upper(const struct arg *arg_p, struct sample *smp, vo
 	return 1;
 }
 
-/* takes the netmask in arg_p */
-static int sample_conv_ipmask(const struct arg *arg_p, struct sample *smp, void *private)
+/* takes the IPv4 mask in args[0] and an optional IPv6 mask in args[1] */
+static int sample_conv_ipmask(const struct arg *args, struct sample *smp, void *private)
 {
-	smp->data.u.ipv4.s_addr &= arg_p->data.ipv4.s_addr;
-	smp->data.type = SMP_T_IPV4;
+	/* Attempt to convert to IPv4 to apply the correct mask. */
+	c_ipv62ip(smp);
+
+	if (smp->data.type == SMP_T_IPV4) {
+		smp->data.u.ipv4.s_addr &= args[0].data.ipv4.s_addr;
+		smp->data.type = SMP_T_IPV4;
+	}
+	else if (smp->data.type == SMP_T_IPV6) {
+		/* IPv6 cannot be converted without an IPv6 mask. */
+		if (args[1].type != ARGT_IPV6)
+			return 0;
+
+		*(uint32_t*)&smp->data.u.ipv6.s6_addr[0]  &= *(uint32_t*)&args[1].data.ipv6.s6_addr[0];
+		*(uint32_t*)&smp->data.u.ipv6.s6_addr[4]  &= *(uint32_t*)&args[1].data.ipv6.s6_addr[4];
+		*(uint32_t*)&smp->data.u.ipv6.s6_addr[8]  &= *(uint32_t*)&args[1].data.ipv6.s6_addr[8];
+		*(uint32_t*)&smp->data.u.ipv6.s6_addr[12] &= *(uint32_t*)&args[1].data.ipv6.s6_addr[12];
+		smp->data.type = SMP_T_IPV6;
+	}
+
 	return 1;
 }
 
@@ -2516,6 +2531,83 @@ static int sample_conv_arith_even(const struct arg *arg_p,
 	return 1;
 }
 
+/* appends an optional const string, an optional variable contents and another
+ * optional const string to an existing string.
+ */
+static int sample_conv_concat(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct chunk *trash;
+	struct sample tmp;
+	int max;
+
+	trash = get_trash_chunk();
+	trash->len = smp->data.u.str.len;
+	if (trash->len > trash->size - 1)
+		trash->len = trash->size - 1;
+
+	memcpy(trash->str, smp->data.u.str.str, trash->len);
+	trash->str[trash->len] = 0;
+
+	/* append first string */
+	max = arg_p[0].data.str.len;
+	if (max > trash->size - 1 - trash->len)
+		max = trash->size - 1 - trash->len;
+
+	if (max) {
+		memcpy(trash->str + trash->len, arg_p[0].data.str.str, max);
+		trash->len += max;
+		trash->str[trash->len] = 0;
+	}
+
+	/* append second string (variable) if it's found and we can turn it
+	 * into a string.
+	 */
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[1].type == ARGT_VAR && vars_get_by_desc(&arg_p[1].data.var, &tmp) &&
+	    (sample_casts[tmp.data.type][SMP_T_STR] == c_none ||
+	     sample_casts[tmp.data.type][SMP_T_STR](&tmp))) {
+
+		max = tmp.data.u.str.len;
+		if (max > trash->size - 1 - trash->len)
+			max = trash->size - 1 - trash->len;
+
+		if (max) {
+			memcpy(trash->str + trash->len, tmp.data.u.str.str, max);
+			trash->len += max;
+			trash->str[trash->len] = 0;
+		}
+	}
+
+	/* append third string */
+	max = arg_p[2].data.str.len;
+	if (max > trash->size - 1 - trash->len)
+		max = trash->size - 1 - trash->len;
+
+	if (max) {
+		memcpy(trash->str + trash->len, arg_p[2].data.str.str, max);
+		trash->len += max;
+		trash->str[trash->len] = 0;
+	}
+
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+/* This function checks the "concat" converter's arguments and extracts the
+ * variable name and its scope.
+ */
+static int smp_check_concat(struct arg *args, struct sample_conv *conv,
+                           const char *file, int line, char **err)
+{
+	/* Try to decode a variable. */
+	if (args[1].data.str.len > 0 && !vars_check_arg(&args[1], NULL)) {
+		memprintf(err, "failed to register variable name '%s'", args[1].data.str.str);
+		return 0;
+	}
+	return 1;
+}
+
 /************************************************************************/
 /*       All supported sample fetch functions must be declared here     */
 /************************************************************************/
@@ -2524,6 +2616,9 @@ static int sample_conv_arith_even(const struct arg *arg_p,
 static int
 smp_fetch_true(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
+	if (!smp_make_rw(smp))
+		return 0;
+
 	smp->data.type = SMP_T_BOOL;
 	smp->data.u.sint = 1;
 	return 1;
@@ -2574,6 +2669,17 @@ smp_fetch_date(const struct arg *args, struct sample *smp, const char *kw, void 
 	smp->flags |= SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
 	return 1;
 }
+
+/* retrieve the current microsecond part of the date  */
+static int
+smp_fetch_date_us(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.u.sint = date.tv_usec;
+	smp->data.type = SMP_T_SINT;
+	smp->flags |= SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	return 1;
+}
+
 
 /* returns the hostname */
 static int
@@ -2768,6 +2874,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "always_true",  smp_fetch_true,  0,            NULL, SMP_T_BOOL, SMP_USE_INTRN },
 	{ "env",          smp_fetch_env,   ARG1(1,STR),  NULL, SMP_T_STR,  SMP_USE_INTRN },
 	{ "date",         smp_fetch_date,  ARG1(0,SINT), NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "date_us",      smp_fetch_date_us,  0,         NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "hostname",     smp_fetch_hostname, 0,         NULL, SMP_T_STR,  SMP_USE_INTRN },
 	{ "nbproc",       smp_fetch_nbproc,0,            NULL, SMP_T_SINT, SMP_USE_INTRN },
 	{ "proc",         smp_fetch_proc,  0,            NULL, SMP_T_SINT, SMP_USE_INTRN },
@@ -2799,7 +2906,7 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "length", sample_conv_length,    0,            NULL, SMP_T_STR,  SMP_T_SINT },
 	{ "hex",    sample_conv_bin2hex,   0,            NULL, SMP_T_BIN,  SMP_T_STR  },
 	{ "hex2i",  sample_conv_hex2int,   0,            NULL, SMP_T_STR,  SMP_T_SINT },
-	{ "ipmask", sample_conv_ipmask,    ARG1(1,MSK4), NULL, SMP_T_IPV4, SMP_T_IPV4 },
+	{ "ipmask", sample_conv_ipmask,    ARG2(1,MSK4,MSK6), NULL, SMP_T_ADDR, SMP_T_IPV4 },
 	{ "ltime",  sample_conv_ltime,     ARG2(1,STR,SINT), NULL, SMP_T_SINT, SMP_T_STR },
 	{ "utime",  sample_conv_utime,     ARG2(1,STR,SINT), NULL, SMP_T_SINT, SMP_T_STR },
 	{ "crc32",  sample_conv_crc32,     ARG1(0,SINT), NULL, SMP_T_BIN,  SMP_T_SINT  },
@@ -2814,6 +2921,7 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "word",   sample_conv_word,      ARG2(2,SINT,STR), sample_conv_field_check, SMP_T_STR,  SMP_T_STR },
 	{ "regsub", sample_conv_regsub,    ARG3(2,REG,STR,STR), sample_conv_regsub_check, SMP_T_STR, SMP_T_STR },
 	{ "sha1",   sample_conv_sha1,      0,            NULL, SMP_T_BIN,  SMP_T_BIN  },
+	{ "concat", sample_conv_concat,    ARG3(1,STR,STR,STR), smp_check_concat, SMP_T_STR,  SMP_T_STR },
 
 	{ "and",    sample_conv_binary_and, ARG1(1,STR), check_operator, SMP_T_SINT, SMP_T_SINT  },
 	{ "or",     sample_conv_binary_or,  ARG1(1,STR), check_operator, SMP_T_SINT, SMP_T_SINT  },

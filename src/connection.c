@@ -63,8 +63,10 @@ void conn_fd_handler(int fd)
 	struct connection *conn = fdtab[fd].owner;
 	unsigned int flags;
 
-	if (unlikely(!conn))
+	if (unlikely(!conn)) {
+		activity[tid].conn_dead++;
 		return;
+	}
 
 	conn_refresh_polling_flags(conn);
 	conn->flags |= CO_FL_WILL_UPDATE;
@@ -1042,6 +1044,15 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 	}
 
 #ifdef USE_OPENSSL
+	if (srv->pp_opts & SRV_PP_V2_AUTHORITY) {
+		value = ssl_sock_get_sni(remote);
+		if (value) {
+			if ((buf_len - ret) < sizeof(struct tlv))
+				return 0;
+			ret += make_tlv(&buf[ret], (buf_len - ret), PP2_TYPE_AUTHORITY, strlen(value), value);
+		}
+	}
+
 	if (srv->pp_opts & SRV_PP_V2_SSL) {
 		struct tlv_ssl *tlv;
 		int ssl_tlv_len = 0;
@@ -1055,7 +1066,7 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 			tlv->client |= PP2_CLIENT_SSL;
 			value = ssl_sock_get_proto_version(remote);
 			if (value) {
-				ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_VERSION, strlen(value)+1, value);
+				ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len-ret-ssl_tlv_len), PP2_SUBTYPE_SSL_VERSION, strlen(value), value);
 			}
 			if (ssl_sock_get_cert_used_sess(remote)) {
 				tlv->client |= PP2_CLIENT_CERT_SESS;
@@ -1067,6 +1078,24 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 				struct chunk *cn_trash = get_trash_chunk();
 				if (ssl_sock_get_remote_common_name(remote, cn_trash) > 0) {
 					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_CN, cn_trash->len, cn_trash->str);
+				}
+			}
+			if (srv->pp_opts & SRV_PP_V2_SSL_KEY_ALG) {
+				struct chunk *pkey_trash = get_trash_chunk();
+				if (ssl_sock_get_pkey_algo(remote, pkey_trash) > 0) {
+					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_KEY_ALG, pkey_trash->len, pkey_trash->str);
+				}
+			}
+			if (srv->pp_opts & SRV_PP_V2_SSL_SIG_ALG) {
+				value = ssl_sock_get_cert_sig(remote);
+				if (value) {
+					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_SIG_ALG, strlen(value), value);
+				}
+			}
+			if (srv->pp_opts & SRV_PP_V2_SSL_CIPHER) {
+				value = ssl_sock_get_cipher_name(remote);
+				if (value) {
+					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_CIPHER, strlen(value), value);
 				}
 			}
 		}

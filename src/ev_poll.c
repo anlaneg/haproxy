@@ -32,28 +32,17 @@
 #define POLLRDHUP 0
 #endif
 
+static int maxfd;   /* # of the highest fd + 1 */
 static unsigned int *fd_evts[2];
 
 /* private data */
 static THREAD_LOCAL int nbfd = 0;
 static THREAD_LOCAL struct pollfd *poll_events = NULL;
 
-static inline void hap_fd_set(int fd, unsigned int *evts)
-{
-	evts[fd / (8*sizeof(*evts))] |= 1U << (fd & (8*sizeof(*evts) - 1));
-}
-
-static inline void hap_fd_clr(int fd, unsigned int *evts)
-{
-	evts[fd / (8*sizeof(*evts))] &= ~(1U << (fd & (8*sizeof(*evts) - 1)));
-}
-
 REGPRM1 static void __fd_clo(int fd)
 {
-	HA_SPIN_LOCK(POLL_LOCK, &poll_lock);
 	hap_fd_clr(fd, fd_evts[DIR_RD]);
 	hap_fd_clr(fd, fd_evts[DIR_WR]);
-	HA_SPIN_UNLOCK(POLL_LOCK, &poll_lock);
 }
 
 /*
@@ -64,42 +53,78 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	int status;
 	int fd;
 	int wait_time;
-	int updt_idx, en, eo;
+	int updt_idx, en;
 	int fds, count;
 	int sr, sw;
+	int old_maxfd, new_maxfd, max_add_fd;
 	unsigned rn, wn; /* read new, write new */
+
+	max_add_fd = -1;
 
 	/* first, scan the update list to find changes */
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		if (!fdtab[fd].owner)
+		if (!fdtab[fd].owner) {
+			activity[tid].poll_drop++;
 			continue;
+		}
 
-		HA_SPIN_LOCK(FD_LOCK, &fdtab[fd].lock);
-		fdtab[fd].updated = 0;
-		fdtab[fd].new = 0;
+		en = fdtab[fd].state;
+		HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
 
-		eo = fdtab[fd].state;
-		en = fd_compute_new_polled_status(eo);
-		fdtab[fd].state = en;
-		HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
-
-		if ((eo ^ en) & FD_EV_POLLED_RW) {
-			/* poll status changed, update the lists */
-			HA_SPIN_LOCK(POLL_LOCK, &poll_lock);
-			if ((eo & ~en) & FD_EV_POLLED_R)
+		/* we have a single state for all threads, which is why we
+		 * don't check the tid_bit. First thread to see the update
+		 * takes it for every other one.
+		 */
+		if (!(en & FD_EV_POLLED_RW)) {
+			if (!fdtab[fd].polled_mask) {
+				/* fd was not watched, it's still not */
+				continue;
+			}
+			/* fd totally removed from poll list */
+			hap_fd_clr(fd, fd_evts[DIR_RD]);
+			hap_fd_clr(fd, fd_evts[DIR_WR]);
+			HA_ATOMIC_AND(&fdtab[fd].polled_mask, 0);
+		}
+		else {
+			/* OK fd has to be monitored, it was either added or changed */
+			if (!(en & FD_EV_POLLED_R))
 				hap_fd_clr(fd, fd_evts[DIR_RD]);
-			else if ((en & ~eo) & FD_EV_POLLED_R)
+			else
 				hap_fd_set(fd, fd_evts[DIR_RD]);
 
-			if ((eo & ~en) & FD_EV_POLLED_W)
+			if (!(en & FD_EV_POLLED_W))
 				hap_fd_clr(fd, fd_evts[DIR_WR]);
-			else if ((en & ~eo) & FD_EV_POLLED_W)
+			else
 				hap_fd_set(fd, fd_evts[DIR_WR]);
-			HA_SPIN_UNLOCK(POLL_LOCK, &poll_lock);
+
+			HA_ATOMIC_OR(&fdtab[fd].polled_mask, tid_bit);
+			if (fd > max_add_fd)
+				max_add_fd = fd;
 		}
 	}
+
+	/* maybe we added at least one fd larger than maxfd */
+	for (old_maxfd = maxfd; old_maxfd <= max_add_fd; ) {
+		if (HA_ATOMIC_CAS(&maxfd, &old_maxfd, max_add_fd + 1))
+			break;
+	}
+
+	/* maxfd doesn't need to be precise but it needs to cover *all* active
+	 * FDs. Thus we only shrink it if we have such an opportunity. The algo
+	 * is simple : look for the previous used place, try to update maxfd to
+	 * point to it, abort if maxfd changed in the mean time.
+	 */
+	old_maxfd = maxfd;
+	do {
+		new_maxfd = old_maxfd;
+		while (new_maxfd - 1 >= 0 && !fdtab[new_maxfd - 1].owner)
+			new_maxfd--;
+		if (new_maxfd >= old_maxfd)
+			break;
+	} while (!HA_ATOMIC_CAS(&maxfd, &old_maxfd, new_maxfd));
+
 	fd_nbupdt = 0;
 
 	nbfd = 0;
@@ -111,13 +136,21 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			continue;
 
 		for (count = 0, fd = fds * 8*sizeof(**fd_evts); count < 8*sizeof(**fd_evts) && fd < maxfd; count++, fd++) {
-
-			if (!fdtab[fd].owner || !(fdtab[fd].thread_mask & tid_bit))
-				continue;
-
 			sr = (rn >> count) & 1;
 			sw = (wn >> count) & 1;
 			if ((sr|sw)) {
+				if (!fdtab[fd].owner) {
+					/* should normally not happen here except
+					 * due to rare thread concurrency
+					 */
+					continue;
+				}
+
+				if (!(fdtab[fd].thread_mask & tid_bit)) {
+					activity[tid].poll_skip++;
+					continue;
+				}
+
 				poll_events[nbfd].fd = fd;
 				poll_events[nbfd].events = (sr ? (POLLIN | POLLRDHUP) : 0) | (sw ? POLLOUT : 0);
 				nbfd++;
@@ -128,8 +161,10 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	/* now let's wait for events */
 	if (!exp)
 		wait_time = MAX_DELAY_MS;
-	else if (tick_is_expired(exp, now_ms))
+	else if (tick_is_expired(exp, now_ms)) {
+		activity[tid].poll_exp++;
 		wait_time = 0;
+	}
 	else {
 		wait_time = TICKS_TO_MS(tick_remain(now_ms, exp)) + 1;
 		if (wait_time > MAX_DELAY_MS)
@@ -152,8 +187,10 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 		/* ok, we found one active fd */
 		status--;
 
-		if (!fdtab[fd].owner)
+		if (!fdtab[fd].owner) {
+			activity[tid].poll_dead++;
 			continue;
+		}
 
 		/* it looks complicated but gcc can optimize it away when constants
 		 * have same values... In fact it depends on gcc :-(

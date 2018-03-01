@@ -30,6 +30,8 @@ extern THREAD_LOCAL unsigned long tid_bit; /* The bit corresponding to the threa
 
 #ifndef USE_THREAD
 
+#define MAX_THREADS 1
+
 #define __decl_hathreads(decl)
 
 #define HA_ATOMIC_CAS(val, old, new) ({((*val) == (*old)) ? (*(val) = (new) , 1) : (*(old) = *(val), 0);})
@@ -42,6 +44,24 @@ extern THREAD_LOCAL unsigned long tid_bit; /* The bit corresponding to the threa
 		typeof(*(val)) __old = *(val);				\
 		*(val) = new;						\
 		__old;							\
+	})
+#define HA_ATOMIC_BTS(val, bit)						\
+	({								\
+		typeof((val)) __p = (val);				\
+		typeof(*__p)  __b = (1UL << (bit));			\
+		typeof(*__p)  __t = *__p & __b;				\
+		if (!__t)						\
+			*__p |= __b;					\
+		__t;							\
+	})
+#define HA_ATOMIC_BTR(val, bit)						\
+	({								\
+		typeof((val)) __p = (val);				\
+		typeof(*__p)  __b = (1UL << (bit));			\
+		typeof(*__p)  __t = *__p & __b;				\
+		if (__t)						\
+			*__p &= ~__b;					\
+		__t;							\
 	})
 #define HA_ATOMIC_STORE(val, new)    ({*(val) = new;})
 #define HA_ATOMIC_UPDATE_MAX(val, new)					\
@@ -87,6 +107,18 @@ extern THREAD_LOCAL unsigned long tid_bit; /* The bit corresponding to the threa
 #define HA_RWLOCK_TRYRDLOCK(lbl, l)   ({ 0; })
 #define HA_RWLOCK_RDUNLOCK(lbl, l) do { /* do nothing */ } while(0)
 
+static inline void __ha_barrier_load(void)
+{
+}
+
+static inline void __ha_barrier_store(void)
+{
+}
+
+static inline void __ha_barrier_full(void)
+{
+}
+
 #else /* USE_THREAD */
 
 #include <stdio.h>
@@ -94,6 +126,8 @@ extern THREAD_LOCAL unsigned long tid_bit; /* The bit corresponding to the threa
 #include <string.h>
 #include <pthread.h>
 #include <import/plock.h>
+
+#define MAX_THREADS LONGBITS
 
 #define __decl_hathreads(decl) decl
 
@@ -141,6 +175,19 @@ extern THREAD_LOCAL unsigned long tid_bit; /* The bit corresponding to the threa
 		} while (!__sync_bool_compare_and_swap(__val, __old, __new));  \
 		__old;							       \
 	})
+
+#define HA_ATOMIC_BTS(val, bit)						\
+	({								\
+		typeof(*(val)) __b = (1UL << (bit));			\
+		__sync_fetch_and_or((val), __b) & __b;			\
+	})
+
+#define HA_ATOMIC_BTR(val, bit)						\
+	({								\
+		typeof(*(val)) __b = (1UL << (bit));			\
+		__sync_fetch_and_and((val), ~__b) & __b;		\
+	})
+
 #define HA_ATOMIC_STORE(val, new)					     \
 	({								       \
 		typeof((val)) __val = (val);				       \
@@ -156,6 +203,18 @@ extern THREAD_LOCAL unsigned long tid_bit; /* The bit corresponding to the threa
 #define HA_ATOMIC_SUB(val, i)        __atomic_sub_fetch(val, i, 0)
 #define HA_ATOMIC_AND(val, flags)    __atomic_and_fetch(val, flags, 0)
 #define HA_ATOMIC_OR(val, flags)     __atomic_or_fetch(val,  flags, 0)
+#define HA_ATOMIC_BTS(val, bit)						\
+	({								\
+		typeof(*(val)) __b = (1UL << (bit));			\
+		__sync_fetch_and_or((val), __b) & __b;			\
+	})
+
+#define HA_ATOMIC_BTR(val, bit)						\
+	({								\
+		typeof(*(val)) __b = (1UL << (bit));			\
+		__sync_fetch_and_and((val), ~__b) & __b;		\
+	})
+
 #define HA_ATOMIC_XCHG(val, new)     __atomic_exchange_n(val, new, 0)
 #define HA_ATOMIC_STORE(val, new)    __atomic_store_n(val, new, 0)
 #endif
@@ -197,12 +256,10 @@ int  thread_need_sync(void);
 
 #if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
 
+/* WARNING!!! if you update this enum, please also keep lock_label() up to date below */
 enum lock_label {
 	THREAD_SYNC_LOCK = 0,
-	FDTAB_LOCK,
-	FDCACHE_LOCK,
 	FD_LOCK,
-	POLL_LOCK,
 	TASK_RQ_LOCK,
 	TASK_WQ_LOCK,
 	POOL_LOCK,
@@ -233,6 +290,8 @@ enum lock_label {
 	PID_LIST_LOCK,
 	EMAIL_ALERTS_LOCK,
 	PIPES_LOCK,
+	START_LOCK,
+	TLSKEYS_REF_LOCK,
 	LOCK_LABELS
 };
 struct lock_stat {
@@ -313,16 +372,51 @@ struct ha_rwlock {
 	} info;
 };
 
+static inline const char *lock_label(enum lock_label label)
+{
+	switch (label) {
+	case THREAD_SYNC_LOCK:     return "THREAD_SYNC";
+	case FD_LOCK:              return "FD";
+	case TASK_RQ_LOCK:         return "TASK_RQ";
+	case TASK_WQ_LOCK:         return "TASK_WQ";
+	case POOL_LOCK:            return "POOL";
+	case LISTENER_LOCK:        return "LISTENER";
+	case LISTENER_QUEUE_LOCK:  return "LISTENER_QUEUE";
+	case PROXY_LOCK:           return "PROXY";
+	case SERVER_LOCK:          return "SERVER";
+	case UPDATED_SERVERS_LOCK: return "UPDATED_SERVERS";
+	case LBPRM_LOCK:           return "LBPRM";
+	case SIGNALS_LOCK:         return "SIGNALS";
+	case STK_TABLE_LOCK:       return "STK_TABLE";
+	case STK_SESS_LOCK:        return "STK_SESS";
+	case APPLETS_LOCK:         return "APPLETS";
+	case PEER_LOCK:            return "PEER";
+	case BUF_WQ_LOCK:          return "BUF_WQ";
+	case STRMS_LOCK:           return "STRMS";
+	case SSL_LOCK:             return "SSL";
+	case SSL_GEN_CERTS_LOCK:   return "SSL_GEN_CERTS";
+	case PATREF_LOCK:          return "PATREF";
+	case PATEXP_LOCK:          return "PATEXP";
+	case PATLRU_LOCK:          return "PATLRU";
+	case VARS_LOCK:            return "VARS";
+	case COMP_POOL_LOCK:       return "COMP_POOL";
+	case LUA_LOCK:             return "LUA";
+	case NOTIF_LOCK:           return "NOTIF";
+	case SPOE_APPLET_LOCK:     return "SPOE_APPLET";
+	case DNS_LOCK:             return "DNS";
+	case PID_LIST_LOCK:        return "PID_LIST";
+	case EMAIL_ALERTS_LOCK:    return "EMAIL_ALERTS";
+	case PIPES_LOCK:           return "PIPES";
+	case START_LOCK:           return "START";
+	case TLSKEYS_REF_LOCK:     return "TLSKEYS_REF";
+	case LOCK_LABELS:          break; /* keep compiler happy */
+	};
+	/* only way to come here is consecutive to an internal bug */
+	abort();
+}
+
 static inline void show_lock_stats()
 {
-	const char *labels[LOCK_LABELS] = {"THREAD_SYNC", "FDTAB", "FDCACHE", "FD", "POLL",
-					   "TASK_RQ", "TASK_WQ", "POOL",
-					   "LISTENER", "LISTENER_QUEUE", "PROXY", "SERVER",
-					   "UPDATED_SERVERS", "LBPRM", "SIGNALS", "STK_TABLE", "STK_SESS",
-					   "APPLETS", "PEER", "BUF_WQ", "STREAMS", "SSL", "SSL_GEN_CERTS",
-					   "PATREF", "PATEXP", "PATLRU", "VARS", "COMP_POOL", "LUA",
-					   "NOTIF", "SPOE_APPLET", "DNS", "PID_LIST", "EMAIL_ALERTS",
-					   "PIPES" };
 	int lbl;
 
 	for (lbl = 0; lbl < LOCK_LABELS; lbl++) {
@@ -336,7 +430,7 @@ static inline void show_lock_stats()
 			"\t # read unlock : %lu (%ld)\n"
 			"\t # wait time for read      : %.3f msec\n"
 			"\t # wait time for read/lock : %.3f nsec\n",
-			labels[lbl],
+			lock_label(lbl),
 			lock_stats[lbl].num_write_locked,
 			lock_stats[lbl].num_write_unlocked,
 			lock_stats[lbl].num_write_unlocked - lock_stats[lbl].num_write_locked,
@@ -629,6 +723,145 @@ static inline void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
 
 #endif  /* DEBUG_THREAD */
 
+#ifdef __x86_64__
+#define HA_HAVE_CAS_DW	1
+#define HA_CAS_IS_8B
+static __inline int
+__ha_cas_dw(void *target, void *compare, const void *set)
+{
+        char ret;
+
+        __asm __volatile("lock cmpxchg16b %0; setz %3"
+                          : "+m" (*(void **)target),
+                            "=a" (((void **)compare)[0]),
+                            "=d" (((void **)compare)[1]),
+                            "=q" (ret)
+                          : "a" (((void **)compare)[0]),
+                            "d" (((void **)compare)[1]),
+                            "b" (((const void **)set)[0]),
+                            "c" (((const void **)set)[1])
+                          : "memory", "cc");
+        return (ret);
+}
+
+static __inline void
+__ha_barrier_load(void)
+{
+	__asm __volatile("lfence" ::: "memory");
+}
+
+static __inline void
+__ha_barrier_store(void)
+{
+	__asm __volatile("sfence" ::: "memory");
+}
+
+static __inline void
+__ha_barrier_full(void)
+{
+	__asm __volatile("mfence" ::: "memory");
+}
+
+#elif defined(__arm__) && (defined(__ARM_ARCH_7__) || defined(__ARM_ARCH_7A__))
+#define HA_HAVE_CAS_DW	1
+static __inline void
+__ha_barrier_load(void)
+{
+	__asm __volatile("dmb" ::: "memory");
+}
+
+static __inline void
+__ha_barrier_store(void)
+{
+	__asm __volatile("dsb" ::: "memory");
+}
+
+static __inline void
+__ha_barrier_full(void)
+{
+	__asm __volatile("dmb" ::: "memory");
+}
+
+static __inline int __ha_cas_dw(void *target, void *compare, const void *set)
+{
+	uint64_t previous;
+	int tmp;
+
+	__asm __volatile("1:"
+	                 "ldrexd %0, [%4];"
+			 "cmp %Q0, %Q2;"
+			 "ittt eq;"
+			 "cmpeq %R0, %R2;"
+			 "strexdeq %1, %3, [%4];"
+			 "cmpeq %1, #1;"
+			 "beq 1b;"
+			 : "=&r" (previous), "=&r" (tmp)
+			 : "r" (*(uint64_t *)compare), "r" (*(uint64_t *)set), "r" (target)
+			 : "memory", "cc");
+	tmp = (previous == *(uint64_t *)compare);
+	*(uint64_t *)compare = previous;
+	return (tmp);
+}
+
+#elif defined (__aarch64__)
+#define HA_HAVE_CAS_DW	1
+#define HA_CAS_IS_8B
+
+static __inline void
+__ha_barrier_load(void)
+{
+	__asm __volatile("dmb ishld" ::: "memory");
+}
+
+static __inline void
+__ha_barrier_store(void)
+{
+	__asm __volatile("dmb ishst" ::: "memory");
+}
+
+static __inline void
+__ha_barrier_full(void)
+{
+	__asm __volatile("dmb ish" ::: "memory");
+}
+
+static __inline int __ha_cas_dw(void *target, void *compare, void *set)
+{
+	void *value[2];
+	uint64_t tmp1, tmp2;
+
+	__asm__ __volatile__("1:"
+                             "ldxp %0, %1, [%4];"
+                             "mov %2, %0;"
+                             "mov %3, %1;"
+                             "eor %0, %0, %5;"
+                             "eor %1, %1, %6;"
+                             "orr %1, %0, %1;"
+                             "mov %w0, #0;"
+                             "cbnz %1, 2f;"
+                             "stxp %w0, %7, %8, [%4];"
+                             "cbnz %w0, 1b;"
+                             "mov %w0, #1;"
+                             "2:"
+                             : "=&r" (tmp1), "=&r" (tmp2), "=&r" (value[0]), "=&r" (value[1])
+                             : "r" (target), "r" (((void **)(compare))[0]), "r" (((void **)(compare))[1]), "r" (((void **)(set))[0]), "r" (((void **)(set))[1])
+                             : "cc", "memory");
+
+	memcpy(compare, &value, sizeof(value));
+        return (tmp1);
+}
+
+#else
+#define __ha_barrier_load __sync_synchronize
+#define __ha_barrier_store __sync_synchronize
+#define __ha_barrier_full __sync_synchronize
+#endif
+
 #endif /* USE_THREAD */
+
+static inline void __ha_compiler_barrier(void)
+{
+	__asm __volatile("" ::: "memory");
+}
 
 #endif /* _COMMON_HATHREADS_H */

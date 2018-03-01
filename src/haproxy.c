@@ -165,6 +165,8 @@ struct global global = {
 	/* others NULL OK */
 };
 
+struct activity activity[MAX_THREADS] __attribute__((aligned(64))) = { };
+
 /*********************************************************************/
 
 int stopping;	/* non zero means stopping in progress */
@@ -1296,7 +1298,7 @@ static void init(int argc, char **argv)
 	 * Initialize the previously static variables.
 	 */
 
-	totalconn = actconn = maxfd = listeners = stopping = 0;
+	totalconn = actconn = listeners = stopping = 0;
 	killed = 0;
 
 
@@ -1443,13 +1445,28 @@ static void init(int argc, char **argv)
 				else
 					oldpids_sig = SIGTERM; /* terminate immediately */
 				while (argc > 1 && argv[1][0] != '-') {
+					char * endptr = NULL;
 					oldpids = realloc(oldpids, (nb_oldpids + 1) * sizeof(int));
 					if (!oldpids) {
 						ha_alert("Cannot allocate old pid : out of memory.\n");
 						exit(1);
 					}
 					argc--; argv++;
-					oldpids[nb_oldpids] = atol(*argv);
+					errno = 0;
+					oldpids[nb_oldpids] = strtol(*argv, &endptr, 10);
+					if (errno) {
+						ha_alert("-%2s option: failed to parse {%s}: %s\n",
+							 flag,
+							 *argv, strerror(errno));
+						exit(1);
+					} else if (endptr && strlen(endptr)) {
+						while (isspace(*endptr)) endptr++;
+						if (*endptr != 0) {
+							ha_alert("-%2s option: some bytes unconsumed in PID list {%s}\n",
+								 flag, endptr);
+							exit(1);
+						}
+					}
 					if (oldpids[nb_oldpids] <= 0)
 						usage(progname);
 					nb_oldpids++;
@@ -2337,14 +2354,15 @@ void mworker_pipe_handler(int fd)
 	return;
 }
 
-void mworker_pipe_register(int pipefd[2])
+/* should only be called once per process */
+void mworker_pipe_register()
 {
-	close(mworker_pipe[1]); /* close the write end of the master pipe in the children */
+	if (fdtab[mworker_pipe[0]].owner)
+		/* already initialized */
+		return;
 
 	fcntl(mworker_pipe[0], F_SETFL, O_NONBLOCK);
-	fdtab[mworker_pipe[0]].owner = mworker_pipe;
-	fdtab[mworker_pipe[0]].iocb = mworker_pipe_handler;
-	fd_insert(mworker_pipe[0], MAX_THREADS_MASK);
+	fd_insert(mworker_pipe[0], mworker_pipe, mworker_pipe_handler, MAX_THREADS_MASK);
 	fd_want_recv(mworker_pipe[0]);
 }
 
@@ -2371,7 +2389,7 @@ static void sync_poll_loop()
 /* Runs the polling loop */
 static void run_poll_loop()
 {
-	int next;
+	int next, exp;
 
 	tv_update_date(0,1);
 	while (1) {
@@ -2389,18 +2407,27 @@ static void run_poll_loop()
 			break;
 
 		/* expire immediately if events are pending */
-		if (fd_cache_num || (active_tasks_mask & tid_bit) || signal_queue_len || (active_applets_mask & tid_bit))
-			next = now_ms;
+		exp = now_ms;
+		if (fd_cache_mask & tid_bit)
+			activity[tid].wake_cache++;
+		else if (active_tasks_mask & tid_bit)
+			activity[tid].wake_tasks++;
+		else if (active_applets_mask & tid_bit)
+			activity[tid].wake_applets++;
+		else if (signal_queue_len)
+			activity[tid].wake_signal++;
+		else
+			exp = next;
 
 		/* The poller will ensure it returns around <next> */
-		cur_poller.poll(&cur_poller, next);
+		cur_poller.poll(&cur_poller, exp);
 		fd_process_cached_events();
 		applet_run_active();
 
 
 		/* Synchronize all polling loops */
 		sync_poll_loop();
-
+		activity[tid].loops++;
 	}
 }
 
@@ -2408,6 +2435,7 @@ static void *run_thread_poll_loop(void *data)
 {
 	struct per_thread_init_fct   *ptif;
 	struct per_thread_deinit_fct *ptdf;
+	__decl_hathreads(static HA_SPINLOCK_T start_lock);
 
 	tid     = *((unsigned int *)data);
 	tid_bit = (1UL << tid);
@@ -2420,8 +2448,11 @@ static void *run_thread_poll_loop(void *data)
 		}
 	}
 
-	if (global.mode & MODE_MWORKER)
-		mworker_pipe_register(mworker_pipe);
+	if (global.mode & MODE_MWORKER) {
+		HA_SPIN_LOCK(START_LOCK, &start_lock);
+		mworker_pipe_register();
+		HA_SPIN_UNLOCK(START_LOCK, &start_lock);
+	}
 
 	protocol_enable_all();
 	THREAD_SYNC_ENABLE();
@@ -2476,6 +2507,7 @@ int main(int argc, char **argv)
 	char errmsg[100];
 	int pidfd = -1;
 
+	setvbuf(stdout, NULL, _IONBF, 0);
 	init(argc, argv);
 	signal_register_fct(SIGQUIT, dump, SIGQUIT);
 	signal_register_fct(SIGUSR1, sig_soft_stop, SIGUSR1);
@@ -2768,7 +2800,8 @@ int main(int argc, char **argv)
 		if (global.mode & MODE_MWORKER) {
 			char pidstr[100];
 			snprintf(pidstr, sizeof(pidstr), "%d\n", getpid());
-			shut_your_big_mouth_gcc(write(pidfd, pidstr, strlen(pidstr)));
+			if (pidfd >= 0)
+				shut_your_big_mouth_gcc(write(pidfd, pidstr, strlen(pidstr)));
 		}
 
 		/* the father launches the required number of processes */
@@ -2849,6 +2882,10 @@ int main(int argc, char **argv)
 
 		/* child must never use the atexit function */
 		atexit_flag = 0;
+
+		/* close the write end of the master pipe in the children */
+		if (global.mode & MODE_MWORKER)
+			close(mworker_pipe[1]);
 
 		if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) {
 			devnullfd = open("/dev/null", O_RDWR, 0);
@@ -2986,7 +3023,7 @@ int main(int argc, char **argv)
 			if (global.cpu_map.proc[relative_pid-1])
 				global.cpu_map.thread[relative_pid-1][i] &= global.cpu_map.proc[relative_pid-1];
 
-			if (i < LONGBITS &&       /* only the first 32/64 threads may be pinned */
+			if (i < MAX_THREADS &&       /* only the first 32/64 threads may be pinned */
 			    global.cpu_map.thread[relative_pid-1][i]) {/* only do this if the thread has a THREAD map */
 #if defined(__FreeBSD__) || defined(__NetBSD__)
 				cpuset_t cpuset;

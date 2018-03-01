@@ -772,7 +772,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 	/* we have two inner loops here, one for the proxy, the other one for
 	 * the buffer.
 	 */
-	while (fd < maxfd) {
+	while (fd < global.maxsock) {
 		struct fdtab fdt;
 		struct listener *li = NULL;
 		struct server *sv = NULL;
@@ -794,7 +794,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			li = fdt.owner;
 
 		chunk_printf(&trash,
-			     "  %5d : st=0x%02x(R:%c%c%c W:%c%c%c) ev=0x%02x(%c%c%c%c%c) [%c%c%c%c] cache=%u owner=%p iocb=%p(%s) tmask=0x%lx",
+			     "  %5d : st=0x%02x(R:%c%c%c W:%c%c%c) ev=0x%02x(%c%c%c%c%c) [%c%c] cache=%u owner=%p iocb=%p(%s) tmask=0x%lx umask=0x%lx",
 			     fd,
 			     fdt.state,
 			     (fdt.state & FD_EV_POLLED_R) ? 'P' : 'p',
@@ -809,18 +809,16 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.ev & FD_POLL_OUT) ? 'O' : 'o',
 			     (fdt.ev & FD_POLL_PRI) ? 'P' : 'p',
 			     (fdt.ev & FD_POLL_IN)  ? 'I' : 'i',
-			     fdt.new ? 'N' : 'n',
-			     fdt.updated ? 'U' : 'u',
 			     fdt.linger_risk ? 'L' : 'l',
 			     fdt.cloned ? 'C' : 'c',
-			     fdt.cache,
+			     fdt.cache.next >= -2 ? 1 : 0,
 			     fdt.owner,
 			     fdt.iocb,
 			     (fdt.iocb == conn_fd_handler)  ? "conn_fd_handler" :
 			     (fdt.iocb == dgram_fd_handler) ? "dgram_fd_handler" :
 			     (fdt.iocb == listener_accept)  ? "listener_accept" :
 			     "unknown",
-			     fdt.thread_mask);
+			     fdt.thread_mask, fdt.update_mask);
 
 		if (fdt.iocb == conn_fd_handler) {
 			chunk_appendf(&trash, " cflg=0x%08x", conn_flags);
@@ -849,6 +847,53 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 		fd++;
 		appctx->ctx.cli.i0 = fd;
+	}
+
+	/* dump complete */
+	return 1;
+}
+
+/* This function dumps some activity counters used by developers and support to
+ * rule out some hypothesis during bug reports. It returns 0 if the output
+ * buffer is full and it needs to be called again, otherwise non-zero. It dumps
+ * everything at once in the buffer and is not designed to do it in multiple
+ * passes.
+ */
+static int cli_io_handler_show_activity(struct appctx *appctx)
+{
+	struct stream_interface *si = appctx->owner;
+	int thr;
+
+	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+		return 1;
+
+	chunk_reset(&trash);
+
+	chunk_appendf(&trash, "thread_id: %u", tid);
+	chunk_appendf(&trash, "\ndate_now: %lu.%06lu", (long)now.tv_sec, (long)now.tv_usec);
+	chunk_appendf(&trash, "\nloops:");        for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].loops);
+	chunk_appendf(&trash, "\nwake_cache:");   for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_cache);
+	chunk_appendf(&trash, "\nwake_tasks:");   for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_tasks);
+	chunk_appendf(&trash, "\nwake_applets:"); for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_applets);
+	chunk_appendf(&trash, "\nwake_signal:");  for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_signal);
+	chunk_appendf(&trash, "\npoll_exp:");     for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_exp);
+	chunk_appendf(&trash, "\npoll_drop:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_drop);
+	chunk_appendf(&trash, "\npoll_dead:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_dead);
+	chunk_appendf(&trash, "\npoll_skip:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_skip);
+	chunk_appendf(&trash, "\nfd_skip:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_skip);
+	chunk_appendf(&trash, "\nfd_lock:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_lock);
+	chunk_appendf(&trash, "\nfd_del:");       for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_del);
+	chunk_appendf(&trash, "\nconn_dead:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].conn_dead);
+	chunk_appendf(&trash, "\nstream:");       for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].stream);
+	chunk_appendf(&trash, "\nempty_rq:");     for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].empty_rq);
+	chunk_appendf(&trash, "\nlong_rq:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].long_rq);
+
+	chunk_appendf(&trash, "\n");
+
+	if (ci_putchk(si_ic(si), &trash) == -1) {
+		chunk_reset(&trash);
+		chunk_printf(&trash, "[output too large, cannot dump]\n");
+		si_applet_cant_put(si);
 	}
 
 	/* dump complete */
@@ -1428,6 +1473,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "env",  NULL }, "show env [var] : dump environment variables known to the process", cli_parse_show_env, cli_io_handler_show_env, NULL },
 	{ { "show", "cli", "sockets",  NULL }, "show cli sockets : dump list of cli sockets", cli_parse_default, cli_io_handler_show_cli_sock, NULL },
 	{ { "show", "fd", NULL }, "show fd [num] : dump list of file descriptors in use", cli_parse_show_fd, cli_io_handler_show_fd, NULL },
+	{ { "show", "activity", NULL }, "show activity : show per-thread activity stats (for support/developers)", cli_parse_default, cli_io_handler_show_activity, NULL },
 	{ { "_getsocks", NULL }, NULL,  _getsocks, NULL },
 	{{},}
 }};

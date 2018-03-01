@@ -468,7 +468,7 @@ static inline int bo_putblk(struct buffer *b, const char *blk, int len)
 	memcpy(b->p, blk, half);
 	b->p = b_ptr(b, half);
 	if (len > half) {
-		memcpy(b->p, blk, len - half);
+		memcpy(b->p, blk + half, len - half);
 		b->p = b_ptr(b, half);
 	}
 	b->o += len;
@@ -577,7 +577,7 @@ static inline int bi_putblk(struct buffer *b, const char *blk, int len)
 
 	memcpy(bi_end(b), blk, half);
 	if (len > half)
-		memcpy(b_ptr(b, b->i + half), blk, len - half);
+		memcpy(b_ptr(b, b->i + half), blk + half, len - half);
 	b->i += len;
 	return len;
 }
@@ -735,13 +735,17 @@ static inline struct buffer *b_alloc_margin(struct buffer **buf, int margin)
 		return *buf;
 
 	*buf = &buf_wanted;
+#ifndef CONFIG_HAP_LOCKLESS_POOLS
 	HA_SPIN_LOCK(POOL_LOCK, &pool_head_buffer->lock);
+#endif
 
 	/* fast path */
 	if ((pool_head_buffer->allocated - pool_head_buffer->used) > margin) {
 		b = __pool_get_first(pool_head_buffer);
 		if (likely(b)) {
+#ifndef CONFIG_HAP_LOCKLESS_POOLS
 			HA_SPIN_UNLOCK(POOL_LOCK, &pool_head_buffer->lock);
+#endif
 			b->size = pool_head_buffer->size - sizeof(struct buffer);
 			b_reset(b);
 			*buf = b;
@@ -752,7 +756,9 @@ static inline struct buffer *b_alloc_margin(struct buffer **buf, int margin)
 	/* slow path, uses malloc() */
 	b = __pool_refill_alloc(pool_head_buffer, margin);
 
+#ifndef CONFIG_HAP_LOCKLESS_POOLS
 	HA_SPIN_UNLOCK(POOL_LOCK, &pool_head_buffer->lock);
+#endif
 
 	if (b) {
 		b->size = pool_head_buffer->size - sizeof(struct buffer);

@@ -86,10 +86,34 @@ int srv_getinter(const struct check *check)
 	return (check->fastinter)?(check->fastinter):(check->inter);
 }
 
-void srv_set_dyncookie(struct server *s)
+/*
+ * Check that we did not get a hash collision.
+ * Unlikely, but it can happen.
+ */
+static inline void srv_check_for_dup_dyncookie(struct server *s)
 {
 	struct proxy *p = s->proxy;
 	struct server *tmpserv;
+
+	for (tmpserv = p->srv; tmpserv != NULL;
+	    tmpserv = tmpserv->next) {
+		if (tmpserv == s)
+			continue;
+		if (tmpserv->next_admin & SRV_ADMF_FMAINT)
+			continue;
+		if (tmpserv->cookie &&
+		    strcmp(tmpserv->cookie, s->cookie) == 0) {
+			ha_warning("We generated two equal cookies for two different servers.\n"
+				   "Please change the secret key for '%s'.\n",
+				   s->proxy->id);
+		}
+	}
+
+}
+
+void srv_set_dyncookie(struct server *s)
+{
+	struct proxy *p = s->proxy;
 	char *tmpbuf;
 	unsigned long long hash_value;
 	size_t key_len;
@@ -136,21 +160,13 @@ void srv_set_dyncookie(struct server *s)
 	if (!s->cookie)
 		return;
 	s->cklen = 16;
-	/*
-	 * Check that we did not get a hash collision.
-	 * Unlikely, but it can happen.
+
+	/* Don't bother checking if the dyncookie is duplicated if
+	 * the server is marked as "disabled", maybe it doesn't have
+	 * its real IP yet, but just a place holder.
 	 */
-	for (tmpserv = p->srv; tmpserv != NULL;
-	    tmpserv = tmpserv->next) {
-		if (tmpserv == s)
-			continue;
-		if (tmpserv->cookie &&
-		    strcmp(tmpserv->cookie, s->cookie) == 0) {
-			ha_warning("We generated two equal cookies for two different servers.\n"
-				   "Please change the secret key for '%s'.\n",
-				   s->proxy->id);
-		}
-	}
+	if (!(s->next_admin & SRV_ADMF_FMAINT))
+		srv_check_for_dup_dyncookie(s);
 }
 
 /*
@@ -485,6 +501,41 @@ static int inline srv_enable_pp_flags(struct server *srv, unsigned int flags)
 {
 	srv->pp_opts |= flags;
 	return 0;
+}
+
+/* parse the "proxy-v2-options" */
+static int srv_parse_proxy_v2_options(char **args, int *cur_arg,
+				      struct proxy *px, struct server *newsrv, char **err)
+{
+	char *p, *n;
+	for (p = args[*cur_arg+1]; p; p = n) {
+		n = strchr(p, ',');
+		if (n)
+			*n++ = '\0';
+		if (!strcmp(p, "ssl")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+		} else if (!strcmp(p, "cert-cn")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_CN;
+		} else if (!strcmp(p, "cert-key")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_KEY_ALG;
+		} else if (!strcmp(p, "cert-sig")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_SIG_ALG;
+		} else if (!strcmp(p, "ssl-cipher")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_CIPHER;
+		} else if (!strcmp(p, "authority")) {
+			newsrv->pp_opts |= SRV_PP_V2_AUTHORITY;
+		} else
+			goto fail;
+	}
+	return 0;
+ fail:
+	if (err)
+		memprintf(err, "'%s' : proxy v2 option not implemented", p);
+	return ERR_ALERT | ERR_FATAL;
 }
 
 /* Parse the "observe" server keyword */
@@ -960,7 +1011,7 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopping(srv, NULL, NULL);
-		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
+		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
 }
 
@@ -1003,7 +1054,7 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_admin_flag(srv, mode, cause);
-		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
+		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
 }
 
@@ -1108,6 +1159,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "no-send-proxy-v2",    srv_parse_no_send_proxy_v2,    0,  1 }, /* Disable use of PROXY V2 protocol */
 	{ "non-stick",           srv_parse_non_stick,           0,  1 }, /* Disable stick-table persistence */
 	{ "observe",             srv_parse_observe,             1,  1 }, /* Enables health adjusting based on observing communication with the server */
+	{ "proxy-v2-options",    srv_parse_proxy_v2_options,    1,  1 }, /* options for send-proxy-v2 */
 	{ "redir",               srv_parse_redir,               1,  1 }, /* Enable redirection mode */
 	{ "send-proxy",          srv_parse_send_proxy,          0,  1 }, /* Enforce use of PROXY V1 protocol */
 	{ "send-proxy-v2",       srv_parse_send_proxy_v2,       0,  1 }, /* Enforce use of PROXY V2 protocol */
@@ -4398,6 +4450,10 @@ static int cli_parse_enable_server(char **args, struct appctx *appctx, void *pri
 		return 1;
 
 	srv_adm_set_ready(sv);
+	if (!(sv->flags & SRV_F_COOKIESET)
+	    && (sv->proxy->ck_opts & PR_CK_DYNAMIC) &&
+	    sv->cookie)
+		srv_check_for_dup_dyncookie(sv);
 	return 1;
 }
 

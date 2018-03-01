@@ -160,7 +160,6 @@
 
 struct fdtab *fdtab = NULL;     /* array of all the file descriptors */
 struct fdinfo *fdinfo = NULL;   /* less-often used infos for file descriptors */
-int maxfd;                      /* # of the highest fd + 1 */
 int totalconn;                  /* total # of terminated sessions */
 int actconn;                    /* # of active sessions */
 
@@ -168,17 +167,185 @@ struct poller pollers[MAX_POLLERS];
 struct poller cur_poller;
 int nbpollers = 0;
 
-unsigned int *fd_cache = NULL; // FD events cache
-int fd_cache_num = 0;          // number of events in the cache
+volatile struct fdlist fd_cache ; // FD events cache
+volatile struct fdlist fd_cache_local[MAX_THREADS]; // FD events local for each thread
+
+unsigned long fd_cache_mask = 0; // Mask of threads with events in the cache
 
 THREAD_LOCAL int *fd_updt  = NULL;  // FD updates list
 THREAD_LOCAL int  fd_nbupdt = 0;   // number of updates in the list
 
-__decl_hathreads(HA_SPINLOCK_T fdtab_lock);       /* global lock to protect fdtab array */
-__decl_hathreads(HA_RWLOCK_T   fdcache_lock);     /* global lock to protect fd_cache array */
-__decl_hathreads(HA_SPINLOCK_T poll_lock);        /* global lock to protect poll info */
+/* adds fd <fd> to fd list <list> if it was not yet in it */
+void fd_add_to_fd_list(volatile struct fdlist *list, int fd)
+{
+	int next;
+	int new;
+	int old;
+	int last;
 
-/* Deletes an FD from the fdsets, and recomputes the maxfd limit.
+redo_next:
+	next = fdtab[fd].cache.next;
+	/* Check that we're not already in the cache, and if not, lock us. */
+	if (next >= -2)
+		goto done;
+	if (!HA_ATOMIC_CAS(&fdtab[fd].cache.next, &next, -2))
+		goto redo_next;
+	__ha_barrier_store();
+
+	new = fd;
+redo_last:
+	/* First, insert in the linked list */
+	last = list->last;
+	old = -1;
+
+	fdtab[fd].cache.prev = -2;
+	/* Make sure the "prev" store is visible before we update the last entry */
+	__ha_barrier_store();
+
+	if (unlikely(last == -1)) {
+		/* list is empty, try to add ourselves alone so that list->last=fd */
+		if (unlikely(!HA_ATOMIC_CAS(&list->last, &old, new)))
+			    goto redo_last;
+
+		/* list->first was necessary -1, we're guaranteed to be alone here */
+		list->first = fd;
+	} else {
+		/* adding ourselves past the last element
+		 * The CAS will only succeed if its next is -1,
+		 * which means it's in the cache, and the last element.
+		 */
+		if (unlikely(!HA_ATOMIC_CAS(&fdtab[last].cache.next, &old, new)))
+			goto redo_last;
+
+		/* Then, update the last entry */
+		list->last = fd;
+	}
+	__ha_barrier_store();
+	/* since we're alone at the end of the list and still locked(-2),
+	 * we know noone tried to add past us. Mark the end of list.
+	 */
+	fdtab[fd].cache.prev = last;
+	fdtab[fd].cache.next = -1;
+	__ha_barrier_store();
+done:
+	return;
+}
+
+/* removes fd <fd> from fd list <list> */
+void fd_rm_from_fd_list(volatile struct fdlist *list, int fd)
+{
+#if defined(HA_HAVE_CAS_DW) || defined(HA_CAS_IS_8B)
+	volatile struct fdlist_entry cur_list, next_list;
+#endif
+	int old;
+	int new = -2;
+	int prev;
+	int next;
+	int last;
+
+lock_self:
+#if (defined(HA_CAS_IS_8B) || defined(HA_HAVE_CAS_DW))
+	next_list.next = next_list.prev = -2;
+	cur_list = fdtab[fd].cache;
+	/* First, attempt to lock our own entries */
+	do {
+		/* The FD is not in the FD cache, give up */
+		if (unlikely(cur_list.next <= -3))
+			return;
+		if (unlikely(cur_list.prev == -2 || cur_list.next == -2))
+			goto lock_self;
+	} while (
+#ifdef HA_CAS_IS_8B
+	    unlikely(!HA_ATOMIC_CAS(((void **)(void *)&fdtab[fd].cache.next), ((void **)(void *)&cur_list), (*(void **)(void *)&next_list))))
+#else
+	    unlikely(!__ha_cas_dw((void *)&fdtab[fd].cache.next, (void *)&cur_list, (void *)&next_list)))
+#endif
+	    ;
+	next = cur_list.next;
+	prev = cur_list.prev;
+
+#else
+lock_self_next:
+	next = ({ volatile int *next = &fdtab[fd].cache.next; *next; });
+	if (next == -2)
+		goto lock_self_next;
+	if (next <= -3)
+		goto done;
+	if (unlikely(!HA_ATOMIC_CAS(&fdtab[fd].cache.next, &next, -2)))
+		goto lock_self_next;
+lock_self_prev:
+	prev = ({ volatile int *prev = &fdtab[fd].cache.prev; *prev; });
+	if (prev == -2)
+		goto lock_self_prev;
+	if (unlikely(!HA_ATOMIC_CAS(&fdtab[fd].cache.prev, &prev, -2)))
+		goto lock_self_prev;
+#endif
+	__ha_barrier_store();
+
+	/* Now, lock the entries of our neighbours */
+	if (likely(prev != -1)) {
+redo_prev:
+		old = fd;
+
+		if (unlikely(!HA_ATOMIC_CAS(&fdtab[prev].cache.next, &old, new))) {
+			if (unlikely(old == -2)) {
+				/* Neighbour already locked, give up and
+				 * retry again once he's done
+				 */
+				fdtab[fd].cache.prev = prev;
+				__ha_barrier_store();
+				fdtab[fd].cache.next = next;
+				__ha_barrier_store();
+				goto lock_self;
+			}
+			goto redo_prev;
+		}
+	}
+	if (likely(next != -1)) {
+redo_next:
+		old = fd;
+		if (unlikely(!HA_ATOMIC_CAS(&fdtab[next].cache.prev, &old, new))) {
+			if (unlikely(old == -2)) {
+				/* Neighbour already locked, give up and
+				 * retry again once he's done
+				 */
+				if (prev != -1) {
+					fdtab[prev].cache.next = fd;
+					__ha_barrier_store();
+				}
+				fdtab[fd].cache.prev = prev;
+				__ha_barrier_store();
+				fdtab[fd].cache.next = next;
+				__ha_barrier_store();
+				goto lock_self;
+			}
+			goto redo_next;
+		}
+	}
+	if (list->first == fd)
+		list->first = next;
+	__ha_barrier_store();
+	last = list->last;
+	while (unlikely(last == fd && (!HA_ATOMIC_CAS(&list->last, &last, prev))))
+		__ha_compiler_barrier();
+	/* Make sure we let other threads know we're no longer in cache,
+	 * before releasing our neighbours.
+	 */
+	__ha_barrier_store();
+	if (likely(prev != -1))
+		fdtab[prev].cache.next = next;
+	__ha_barrier_store();
+	if (likely(next != -1))
+		fdtab[next].cache.prev = prev;
+	__ha_barrier_store();
+	/* Ok, now we're out of the fd cache */
+	fdtab[fd].cache.next = -(next + 4);
+	__ha_barrier_store();
+done:
+	return;
+}
+
+/* Deletes an FD from the fdsets.
  * The file descriptor is also closed.
  */
 static void fd_dodelete(int fd, int do_close)
@@ -198,20 +365,16 @@ static void fd_dodelete(int fd, int do_close)
 	port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 	fdinfo[fd].port_range = NULL;
 	fdtab[fd].owner = NULL;
-	fdtab[fd].updated = 0;
-	fdtab[fd].new = 0;
+	fdtab[fd].update_mask &= ~tid_bit;
 	fdtab[fd].thread_mask = 0;
-	if (do_close)
+	if (do_close) {
+		fdtab[fd].polled_mask = 0;
 		close(fd);
+	}
 	HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
-
-	HA_SPIN_LOCK(FDTAB_LOCK, &fdtab_lock);
-	while ((maxfd-1 >= 0) && !fdtab[maxfd-1].owner)
-		maxfd--;
-	HA_SPIN_UNLOCK(FDTAB_LOCK, &fdtab_lock);
 }
 
-/* Deletes an FD from the fdsets, and recomputes the maxfd limit.
+/* Deletes an FD from the fdsets.
  * The file descriptor is also closed.
  */
 void fd_delete(int fd)
@@ -219,7 +382,7 @@ void fd_delete(int fd)
 	fd_dodelete(fd, 1);
 }
 
-/* Deletes an FD from the fdsets, and recomputes the maxfd limit.
+/* Deletes an FD from the fdsets.
  * The file descriptor is kept open.
  */
 void fd_remove(int fd)
@@ -227,28 +390,29 @@ void fd_remove(int fd)
 	fd_dodelete(fd, 0);
 }
 
-/* Scan and process the cached events. This should be called right after
- * the poller. The loop may cause new entries to be created, for example
- * if a listener causes an accept() to initiate a new incoming connection
- * wanting to attempt an recv().
- */
-void fd_process_cached_events()
+static inline void fdlist_process_cached_events(volatile struct fdlist *fdlist)
 {
-	int fd, entry, e;
+	int fd, old_fd, e;
 
-	if (!fd_cache_num)
-		return;
-
-	HA_RWLOCK_RDLOCK(FDCACHE_LOCK, &fdcache_lock);
-	for (entry = 0; entry < fd_cache_num; ) {
-		fd = fd_cache[entry];
-
+	for (old_fd = fd = fdlist->first; fd != -1; fd = fdtab[fd].cache.next) {
+		if (fd == -2) {
+			fd = old_fd;
+			continue;
+		} else if (fd <= -3)
+			fd = -fd - 4;
+		if (fd == -1)
+			break;
+		old_fd = fd;
 		if (!(fdtab[fd].thread_mask & tid_bit))
-			goto next;
-		if (HA_SPIN_TRYLOCK(FD_LOCK, &fdtab[fd].lock))
-			goto next;
+			continue;
+		if (fdtab[fd].cache.next < -3)
+			continue;
 
-		HA_RWLOCK_RDUNLOCK(FDCACHE_LOCK, &fdcache_lock);
+		HA_ATOMIC_OR(&fd_cache_mask, tid_bit);
+		if (HA_SPIN_TRYLOCK(FD_LOCK, &fdtab[fd].lock)) {
+			activity[tid].fd_lock++;
+			continue;
+		}
 
 		e = fdtab[fd].state;
 		fdtab[fd].ev &= FD_POLL_STICKY;
@@ -267,17 +431,19 @@ void fd_process_cached_events()
 			fd_release_cache_entry(fd);
 			HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
 		}
-
-		HA_RWLOCK_RDLOCK(FDCACHE_LOCK, &fdcache_lock);
-		/* If the fd was removed from the cache, it has been
-		 * replaced by the next one that we don't want to skip !
-		 */
-		if (entry < fd_cache_num && fd_cache[entry] != fd)
-			continue;
-	  next:
-		entry++;
 	}
-	HA_RWLOCK_RDUNLOCK(FDCACHE_LOCK, &fdcache_lock);
+}
+
+/* Scan and process the cached events. This should be called right after
+ * the poller. The loop may cause new entries to be created, for example
+ * if a listener causes an accept() to initiate a new incoming connection
+ * wanting to attempt an recv().
+ */
+void fd_process_cached_events()
+{
+	HA_ATOMIC_AND(&fd_cache_mask, ~tid_bit);
+	fdlist_process_cached_events(&fd_cache_local[tid]);
+	fdlist_process_cached_events(&fd_cache);
 }
 
 /* disable the specified poller */
@@ -320,18 +486,19 @@ int init_pollers()
 	if ((fdinfo = calloc(global.maxsock, sizeof(struct fdinfo))) == NULL)
 		goto fail_info;
 
-	if ((fd_cache = calloc(global.maxsock, sizeof(*fd_cache))) == NULL)
-		goto fail_cache;
-
+	fd_cache.first = fd_cache.last = -1;
 	hap_register_per_thread_init(init_pollers_per_thread);
 	hap_register_per_thread_deinit(deinit_pollers_per_thread);
 
-	for (p = 0; p < global.maxsock; p++)
+	for (p = 0; p < global.maxsock; p++) {
 		HA_SPIN_INIT(&fdtab[p].lock);
+		/* Mark the fd as out of the fd cache */
+		fdtab[p].cache.next = -3;
+		fdtab[p].cache.next = -3;
+	}
+	for (p = 0; p < global.nbthread; p++)
+		fd_cache_local[p].first = fd_cache_local[p].last = -1;
 
-	HA_SPIN_INIT(&fdtab_lock);
-	HA_RWLOCK_INIT(&fdcache_lock);
-	HA_SPIN_INIT(&poll_lock);
 	do {
 		bp = NULL;
 		for (p = 0; p < nbpollers; p++)
@@ -374,13 +541,8 @@ void deinit_pollers() {
 			bp->term(bp);
 	}
 
-	free(fd_cache); fd_cache = NULL;
 	free(fdinfo);   fdinfo   = NULL;
 	free(fdtab);    fdtab    = NULL;
-
-	HA_SPIN_DESTROY(&fdtab_lock);
-	HA_RWLOCK_DESTROY(&fdcache_lock);
-	HA_SPIN_DESTROY(&poll_lock);
 }
 
 /*
@@ -448,7 +610,7 @@ int list_pollers(FILE *out)
 int fork_poller()
 {
 	int fd;
-	for (fd = 0; fd <= maxfd; fd++) {
+	for (fd = 0; fd < global.maxsock; fd++) {
 		if (fdtab[fd].owner) {
 			fdtab[fd].cloned = 1;
 		}

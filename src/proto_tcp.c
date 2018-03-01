@@ -314,20 +314,20 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 		if (errno == ENFILE) {
 			conn->err_code = CO_ER_SYS_FDLIM;
 			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system FD limit at %d. Please check system tunables.\n",
-				 be->id, maxfd);
+				 "Proxy %s reached system FD limit (maxsock=%d). Please check system tunables.\n",
+				 be->id, global.maxsock);
 		}
 		else if (errno == EMFILE) {
 			conn->err_code = CO_ER_PROC_FDLIM;
 			send_log(be, LOG_EMERG,
-				 "Proxy %s reached process FD limit at %d. Please check 'ulimit-n' and restart.\n",
-				 be->id, maxfd);
+				 "Proxy %s reached process FD limit (maxsock=%d). Please check 'ulimit-n' and restart.\n",
+				 be->id, global.maxsock);
 		}
 		else if (errno == ENOBUFS || errno == ENOMEM) {
 			conn->err_code = CO_ER_SYS_MEMLIM;
 			send_log(be, LOG_EMERG,
-				 "Proxy %s reached system memory limit at %d sockets. Please check system tunables.\n",
-				 be->id, maxfd);
+				 "Proxy %s reached system memory limit (maxsock=%d). Please check system tunables.\n",
+				 be->id, global.maxsock);
 		}
 		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
 			conn->err_code = CO_ER_NOPROTO;
@@ -1105,12 +1105,9 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	listener->fd = fd;
 	listener->state = LI_LISTEN;
 
-	fdtab[fd].owner = listener; /* reference the listener instead of a task */
-	fdtab[fd].iocb = listener->proto->accept;
-	if (listener->bind_conf->bind_thread[relative_pid-1])
-		fd_insert(fd, listener->bind_conf->bind_thread[relative_pid-1]);
-	else
-		fd_insert(fd, MAX_THREADS_MASK);
+	fd_insert(fd, listener, listener->proto->accept,
+		  listener->bind_conf->bind_thread[relative_pid-1] ?
+		  listener->bind_conf->bind_thread[relative_pid-1] : MAX_THREADS_MASK);
 
  tcp_return:
 	if (msg && errlen) {

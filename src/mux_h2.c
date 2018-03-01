@@ -59,6 +59,7 @@ static struct pool_head *pool_head_h2s;
 /* other flags */
 #define H2_CF_GOAWAY_SENT       0x00000100  // a GOAWAY frame was successfully sent
 #define H2_CF_GOAWAY_FAILED     0x00000200  // a GOAWAY frame failed to be sent
+#define H2_CF_WAIT_FOR_HS       0x00000400  // We did check that at least a stream was waiting for handshake
 
 
 /* H2 connection state, in h2c->st0 */
@@ -276,7 +277,7 @@ static inline struct buffer *h2_get_dbuf(struct h2c *h2c)
 
 	if (likely(LIST_ISEMPTY(&h2c->dbuf_wait.list)) &&
 	    unlikely((buf = b_alloc_margin(&h2c->dbuf, 0)) == NULL)) {
-		h2c->dbuf_wait.target = h2c->conn;
+		h2c->dbuf_wait.target = h2c;
 		h2c->dbuf_wait.wakeup_cb = h2_dbuf_available;
 		HA_SPIN_LOCK(BUF_WQ_LOCK, &buffer_wq_lock);
 		LIST_ADDQ(&buffer_wq, &h2c->dbuf_wait.list);
@@ -2275,14 +2276,25 @@ static int h2_wake(struct connection *conn)
 	}
 
 	/*
-	 * If we received early data, try to wake any stream, just in case
-	 * at least one of them was waiting for the handshake
+	 * If we received early data, and the handshake is done, wake
+	 * any stream that was waiting for it.
 	 */
-	if ((conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_EARLY_DATA | CO_FL_HANDSHAKE)) ==
-	    CO_FL_EARLY_DATA) {
-		h2_wake_some_streams(h2c, 0, 0);
-		conn->flags &= ~CO_FL_EARLY_DATA;
+	if (!(h2c->flags & H2_CF_WAIT_FOR_HS) &&
+	    (conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_HANDSHAKE | CO_FL_EARLY_DATA)) == CO_FL_EARLY_DATA) {
+		struct eb32_node *node;
+		struct h2s *h2s;
+
+		h2c->flags |= H2_CF_WAIT_FOR_HS;
+		node = eb32_lookup_ge(&h2c->streams_by_id, 1);
+
+		while (node) {
+			h2s = container_of(node, struct h2s, by_id);
+			if (h2s->cs->flags & CS_FL_WAIT_FOR_HS)
+				h2s->cs->data_cb->wake(h2s->cs);
+			node = eb32_next(node);
+		}
 	}
+
 	if (conn->flags & CO_FL_ERROR || conn_xprt_read0_pending(conn) ||
 	    h2c->st0 == H2_CS_ERROR2 || h2c->flags & H2_CF_GOAWAY_FAILED ||
 	    (eb_is_empty(&h2c->streams_by_id) && h2c->last_sid >= 0 &&
@@ -2901,7 +2913,6 @@ static int h2s_frt_make_resp_headers(struct h2s *h2s, struct buffer *buf)
 	 * block does not wrap and we can safely read it this way without
 	 * having to realign the buffer.
 	 */
- next_header_block:
 	ret = h1_headers_to_hdr_list(bo_ptr(buf), bo_ptr(buf) + buf->o,
 	                             list, sizeof(list)/sizeof(list[0]), h1m);
 	if (ret <= 0) {
@@ -2920,7 +2931,6 @@ static int h2s_frt_make_resp_headers(struct h2s *h2s, struct buffer *buf)
 
 	chunk_reset(&outbuf);
 
- try_again:
 	while (1) {
 		outbuf.str  = bo_end(h2c->mbuf);
 		outbuf.size = bo_contig_space(h2c->mbuf);
@@ -3020,6 +3030,9 @@ static int h2s_frt_make_resp_headers(struct h2s *h2s, struct buffer *buf)
 	 * body or directly end in TRL2.
 	 */
 	if (es_now) {
+		// trim any possibly pending data (eg: inconsistent content-length)
+		bo_del(buf, buf->o);
+
 		h1m->state = HTTP_MSG_DONE;
 		h2s->flags |= H2_SF_ES_SENT;
 		if (h2s->st == H2_SS_OPEN)
@@ -3269,8 +3282,12 @@ static int h2s_frt_make_resp_data(struct h2s *h2s, struct buffer *buf)
 		else
 			h2c_stream_close(h2c, h2s);
 
-		if (!(h1m->flags & H1_MF_CHNK))
+		if (!(h1m->flags & H1_MF_CHNK)) {
+			// trim any possibly pending data (eg: inconsistent content-length)
+			bo_del(buf, buf->o);
+
 			h1m->state = HTTP_MSG_DONE;
+		}
 
 		h2s->flags |= H2_SF_ES_SENT;
 	}
@@ -3319,6 +3336,10 @@ static int h2_snd_buf(struct conn_stream *cs, struct buffer *buf, int flags)
 			}
 			total += count;
 			bo_del(buf, count);
+
+			// trim any possibly pending data (eg: extra CR-LF, ...)
+			bo_del(buf, buf->o);
+
 			h2s->res.state = HTTP_MSG_DONE;
 			break;
 		}

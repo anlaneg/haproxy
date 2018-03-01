@@ -58,7 +58,6 @@
 #define SPOE_APPCTX_FL_PIPELINING    0x00000001 /* Set if pipelining is supported */
 #define SPOE_APPCTX_FL_ASYNC         0x00000002 /* Set if asynchronus frames is supported */
 #define SPOE_APPCTX_FL_FRAGMENTATION 0x00000004 /* Set if fragmentation is supported */
-#define SPOE_APPCTX_FL_PERSIST       0x00000008 /* Set if the applet is persistent */
 
 #define SPOE_APPCTX_ERR_NONE    0x00000000 /* no error yet, leave it to zero */
 #define SPOE_APPCTX_ERR_TOUT    0x00000001 /* SPOE applet timeout */
@@ -249,7 +248,6 @@ struct spoe_agent {
 	unsigned int          cps_max;        /* Maximum # of connections per second */
 	unsigned int          eps_max;        /* Maximum # of errors per second */
 	unsigned int          max_frame_size; /* Maximum frame size for this agent, before any negotiation */
-	unsigned int          min_applets;    /* Minimum # applets alive at a time */
 	unsigned int          max_fpa;        /* Maximum # of frames handled per applet at once */
 
 	struct list events[SPOE_EV_EVENTS];   /* List of SPOE messages that will be sent
@@ -262,14 +260,18 @@ struct spoe_agent {
 	/* running info */
 	struct {
 		unsigned int    frame_size;     /* current maximum frame size, only used to encode messages */
+#if defined(DEBUG_SPOE) || defined(DEBUG_FULL)
 		unsigned int    applets_act;    /* # of applets alive at a time */
 		unsigned int    applets_idle;   /* # of applets in the state SPOE_APPCTX_ST_IDLE */
-		unsigned int    sending_rate;   /* the global sending rate */
+#endif
+		unsigned int    processing;
+		struct freq_ctr processing_per_sec;
 
 		struct freq_ctr conn_per_sec;   /* connections per second */
 		struct freq_ctr err_per_sec;    /* connetion errors per second */
 
-		struct list     applets;        /* List of available SPOE applets */
+		struct eb_root  idle_applets;   /* idle SPOE applets available to process data */
+		struct list     applets;        /* all SPOE applets for this agent */
 		struct list     sending_queue;  /* Queue of streams waiting to send data */
 		struct list     waiting_queue;  /* Queue of streams waiting for a ack, in async mode */
 		__decl_hathreads(HA_SPINLOCK_T lock);
@@ -307,8 +309,8 @@ struct spoe_context {
 	unsigned int        frame_id;     /* to map NOTIFY and ACK frames */
 	unsigned int        process_exp;  /* expiration date to process an event */
 
+	struct spoe_appctx *spoe_appctx; /* SPOE appctx sending the current frame */
 	struct {
-		struct spoe_appctx  *spoe_appctx; /* SPOE appctx sending the fragmented frame */
 		struct spoe_message *curmsg;      /* SPOE message from which to resume encoding */
 		struct spoe_arg     *curarg;      /* SPOE arg in <curmsg> from which to resume encoding */
 		unsigned int         curoff;      /* offset in <curarg> from which to resume encoding */
@@ -336,6 +338,8 @@ struct spoe_appctx {
 	struct buffer_wait  buffer_wait;    /* position in the list of ressources waiting for a buffer */
 	struct list         waiting_queue;  /* list of streams waiting for a ACK frame, in sync and pipelining mode */
 	struct list         list;           /* next spoe appctx for the same agent */
+	struct eb32_node    node;           /* node used for applets tree */
+	unsigned int        cur_fpa;
 
 	struct {
 		struct spoe_context *ctx;    /* SPOE context owning the fragmented frame */

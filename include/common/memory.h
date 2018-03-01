@@ -26,6 +26,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <common/config.h>
 #include <common/mini-clist.h>
@@ -47,10 +48,20 @@
 #define POOL_LINK(pool, item) ((void **)(item))
 #endif
 
-struct pool_head {
-	__decl_hathreads(HA_SPINLOCK_T lock); /* the spin lock */
+#ifdef CONFIG_HAP_LOCKLESS_POOLS
+struct pool_free_list {
 	void **free_list;
-	struct list list;	/* list of all known pools */
+	uintptr_t seq;
+};
+#endif
+
+struct pool_head {
+	void **free_list;
+#ifdef CONFIG_HAP_LOCKLESS_POOLS
+	uintptr_t seq;
+#else
+	__decl_hathreads(HA_SPINLOCK_T lock); /* the spin lock */
+#endif
 	unsigned int used;	/* how many chunks are currently in use */
 	unsigned int allocated;	/* how many chunks have been allocated */
 	unsigned int limit;	/* hard limit on the number of chunks */
@@ -59,6 +70,7 @@ struct pool_head {
 	unsigned int flags;	/* MEM_F_* */
 	unsigned int users;	/* number of pools sharing this zone */
 	unsigned int failed;	/* failed allocations */
+	struct list list;	/* list of all known pools */
 	char name[12];		/* name of the pool */
 } __attribute__((aligned(64)));
 
@@ -111,6 +123,110 @@ void pool_gc(struct pool_head *pool_ctx);
  */
 void *pool_destroy(struct pool_head *pool);
 
+#ifdef CONFIG_HAP_LOCKLESS_POOLS
+/*
+ * Returns a pointer to type <type> taken from the pool <pool_type> if
+ * available, otherwise returns NULL. No malloc() is attempted, and poisonning
+ * is never performed. The purpose is to get the fastest possible allocation.
+ */
+static inline void *__pool_get_first(struct pool_head *pool)
+{
+	struct pool_free_list cmp, new;
+
+	cmp.seq = pool->seq;
+	__ha_barrier_load();
+
+	cmp.free_list = pool->free_list;
+	do {
+		if (cmp.free_list == NULL)
+			return NULL;
+		new.seq = cmp.seq + 1;
+		__ha_barrier_load();
+		new.free_list = *POOL_LINK(pool, cmp.free_list);
+	} while (__ha_cas_dw((void *)&pool->free_list, (void *)&cmp, (void *)&new) == 0);
+
+	HA_ATOMIC_ADD(&pool->used, 1);
+#ifdef DEBUG_MEMORY_POOLS
+	/* keep track of where the element was allocated from */
+	*POOL_LINK(pool, cmp.free_list) = (void *)pool;
+#endif
+	return cmp.free_list;
+}
+
+static inline void *pool_get_first(struct pool_head *pool)
+{
+	void *ret;
+
+	ret = __pool_get_first(pool);
+	return ret;
+}
+/*
+ * Returns a pointer to type <type> taken from the pool <pool_type> or
+ * dynamically allocated. In the first case, <pool_type> is updated to point to
+ * the next element in the list. No memory poisonning is ever performed on the
+ * returned area.
+ */
+static inline void *pool_alloc_dirty(struct pool_head *pool)
+{
+	void *p;
+
+	if ((p = __pool_get_first(pool)) == NULL)
+		p = __pool_refill_alloc(pool, 0);
+	return p;
+}
+
+/*
+ * Returns a pointer to type <type> taken from the pool <pool_type> or
+ * dynamically allocated. In the first case, <pool_type> is updated to point to
+ * the next element in the list. Memory poisonning is performed if enabled.
+ */
+static inline void *pool_alloc(struct pool_head *pool)
+{
+	void *p;
+
+	p = pool_alloc_dirty(pool);
+#ifdef DEBUG_MEMORY_POOLS
+	if (p) {
+		/* keep track of where the element was allocated from */
+		*POOL_LINK(pool, p) = (void *)pool;
+	}
+#endif
+	if (p && mem_poison_byte >= 0) {
+		memset(p, mem_poison_byte, pool->size);
+	}
+
+	return p;
+}
+
+/*
+ * Puts a memory area back to the corresponding pool.
+ * Items are chained directly through a pointer that
+ * is written in the beginning of the memory area, so
+ * there's no need for any carrier cell. This implies
+ * that each memory area is at least as big as one
+ * pointer. Just like with the libc's free(), nothing
+ * is done if <ptr> is NULL.
+ */
+static inline void pool_free(struct pool_head *pool, void *ptr)
+{
+        if (likely(ptr != NULL)) {
+		void *free_list;
+#ifdef DEBUG_MEMORY_POOLS
+		/* we'll get late corruption if we refill to the wrong pool or double-free */
+		if (*POOL_LINK(pool, ptr) != (void *)pool)
+			*(volatile int *)0 = 0;
+#endif
+		free_list = pool->free_list;
+		do {
+			*POOL_LINK(pool, ptr) = (void *)free_list;
+			__ha_barrier_store();
+		} while (!HA_ATOMIC_CAS(&pool->free_list, (void *)&free_list, ptr));
+
+		HA_ATOMIC_SUB(&pool->used, 1);
+	}
+}
+
+#else /* CONFIG_HAP_LOCKLESS_POOLS */
 /*
  * Returns a pointer to type <type> taken from the pool <pool_type> if
  * available, otherwise returns NULL. No malloc() is attempted, and poisonning
@@ -182,22 +298,35 @@ static inline void pool_free_area(void *area, size_t __maybe_unused size)
  * to those of malloc(). However the allocation is rounded up to 4kB so that a
  * full page is allocated. This ensures the object can be freed alone so that
  * future dereferences are easily detected. The returned object is always
- * 16-bytes aligned to avoid issues with unaligned structure objects.
+ * 16-bytes aligned to avoid issues with unaligned structure objects. In case
+ * some padding is added, the area's start address is copied at the end of the
+ * padding to help detect underflows.
  */
 static inline void *pool_alloc_area(size_t size)
 {
 	size_t pad = (4096 - size) & 0xFF0;
+	void *ret;
 
-	return mmap(NULL, (size + 4095) & -4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0) + pad;
+	ret = mmap(NULL, (size + 4095) & -4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+	if (ret == MAP_FAILED)
+		return NULL;
+	if (pad >= sizeof(void *))
+		*(void **)(ret + pad - sizeof(void *)) = ret + pad;
+	return ret + pad;
 }
 
 /* frees an area <area> of size <size> allocated by pool_alloc_area(). The
  * semantics are identical to free() except that the size must absolutely match
- * the one passed to pool_alloc_area().
+ * the one passed to pool_alloc_area(). In case some padding is added, the
+ * area's start address is compared to the one at the end of the padding, and
+ * a segfault is triggered if they don't match, indicating an underflow.
  */
 static inline void pool_free_area(void *area, size_t size)
 {
 	size_t pad = (4096 - size) & 0xFF0;
+
+	if (pad >= sizeof(void *) && *(void **)(area - sizeof(void *)) != area)
+		*(volatile int *)0 = 0;
 
 	munmap(area - pad, (size + 4095) & -4096);
 }
@@ -261,6 +390,7 @@ static inline void pool_free(struct pool_head *pool, void *ptr)
 		HA_SPIN_UNLOCK(POOL_LOCK, &pool->lock);
 	}
 }
+#endif /* CONFIG_HAP_LOCKLESS_POOLS */
 #endif /* _COMMON_MEMORY_H */
 
 /*

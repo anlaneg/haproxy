@@ -662,7 +662,6 @@ int parse_process_number(const char *arg, unsigned long *proc, int *autoinc, cha
 			*proc |= 1UL << (low-1);
 	}
 
-  end:
 	return 0;
 }
 
@@ -1175,12 +1174,6 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.nbthread = atol(args[1]);
-		if (global.nbthread < 1 || global.nbthread > LONGBITS) {
-			ha_alert("parsing [%s:%d] : '%s' must be between 1 and %d (was %d).\n",
-				 file, linenum, args[0], LONGBITS, global.nbthread);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
 #ifndef USE_THREAD
 		if (global.nbthread > 1) {
 			ha_alert("HAProxy is not compiled with threads support, please check build options for USE_THREAD.\n");
@@ -1189,6 +1182,12 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 #endif
+		if (global.nbthread < 1 || global.nbthread > MAX_THREADS) {
+			ha_alert("parsing [%s:%d] : '%s' must be between 1 and %d (was %d).\n",
+				 file, linenum, args[0], MAX_THREADS, global.nbthread);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 	}
 	else if (!strcmp(args[0], "maxconn")) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
@@ -1801,7 +1800,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			}
 
 			/* Mapping at the thread level */
-			for (j = 0; j < LONGBITS; j++) {
+			for (j = 0; j < MAX_THREADS; j++) {
 				/* Np mapping for this thread */
 				if (!(thread & (1UL << j)))
 					continue;
@@ -4827,6 +4826,12 @@ stats_error_parsing:
 			free(curproxy->conf.lfs_file);
 			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
 			curproxy->conf.lfs_line = curproxy->conf.args.line;
+
+			if (curproxy != &defproxy && !(curproxy->cap & PR_CAP_FE)) {
+				ha_warning("parsing [%s:%d] : backend '%s' : 'option httplog' directive is ignored in backends.\n",
+					file, linenum, curproxy->id);
+				err_code |= ERR_WARN;
+			}
 		}
 		else if (!strcmp(args[1], "tcplog")) {
 			if (curproxy->conf.logformat_string && curproxy == &defproxy) {
@@ -4854,6 +4859,12 @@ stats_error_parsing:
 
 			if (alertif_too_many_args_idx(0, 1, file, linenum, args, &err_code))
 				goto out;
+
+			if (curproxy != &defproxy && !(curproxy->cap & PR_CAP_FE)) {
+				ha_warning("parsing [%s:%d] : backend '%s' : 'option tcplog' directive is ignored in backends.\n",
+					file, linenum, curproxy->id);
+				err_code |= ERR_WARN;
+			}
 		}
 		else if (!strcmp(args[1], "tcpka")) {
 			/* enable TCP keep-alives on client and server streams */
@@ -7120,6 +7131,31 @@ cfg_parse_scope(const char *file, int linenum, char *line)
 	return err_code;
 }
 
+int
+cfg_parse_track_sc_num(unsigned int *track_sc_num,
+                       const char *arg, const char *end, char **errmsg)
+{
+	const char *p;
+	unsigned int num;
+
+	p = arg;
+	num = read_uint64(&arg, end);
+
+	if (arg != end) {
+		memprintf(errmsg, "Wrong track-sc number '%s'", p);
+		return -1;
+	}
+
+	if (num >= MAX_SESS_STKCTR) {
+		memprintf(errmsg, "%u track-sc number exceeding "
+		          "%d (MAX_SESS_STKCTR-1) value", num, MAX_SESS_STKCTR - 1);
+		return -1;
+	}
+
+	*track_sc_num = num;
+	return 0;
+}
+
 /*
  * This function reads and parses the configuration file given in the argument.
  * Returns the error code, 0 if OK, or any combination of :
@@ -7702,7 +7738,7 @@ int check_config_validity()
 			break;
 		}
 
-		if ((curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners)) {
+		if (curproxy != global.stats_fe && (curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners)) {
 			ha_warning("config : %s '%s' has no 'bind' directive. Please declare it as a backend if this was intended.\n",
 				   proxy_type_str(curproxy), curproxy->id);
 			err_code |= ERR_WARN;
